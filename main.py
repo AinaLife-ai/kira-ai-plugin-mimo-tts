@@ -1,4 +1,3 @@
-import os
 import base64
 import re
 import time
@@ -9,7 +8,6 @@ from core.plugin import BasePlugin, logger, on, register
 from core.chat import MessageChain
 from core.chat.message_elements import At, Record, Reply, Text
 from core.provider import LLMResponse
-from core.utils.path_utils import get_data_path
 
 MIMO_TTS_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions"
 MIMO_TTS_MODEL = "mimo-v2.5-tts-voicedesign"
@@ -22,8 +20,6 @@ class MiMoTTSPlugin(BasePlugin):
         self.api_key: str = cfg.get("api_key", "") or ""
         self.default_voice: str = cfg.get("default_voice", "一个年轻温柔的女性声音，语速适中，语调自然亲切")
         self.auto_format_fix: bool = cfg.get("auto_format_fix", True)
-        self.temp_dir = os.path.join(str(get_data_path()), "temp", "mimo_tts")
-        os.makedirs(self.temp_dir, exist_ok=True)
 
     async def initialize(self):
         if self.api_key:
@@ -75,6 +71,10 @@ class MiMoTTSPlugin(BasePlugin):
 
         与官方 <record> 标签同机制：LLM 决策、合成、发送在同一个 LLM 步骤内完成，
         不产生额外的工具调用步骤，也不会出现工具结果后 LLM 输出空 <msg/> 的问题。
+
+        音频以 base64 交给框架（与框架自带 TTS 客户端一致），由消息元素在发送时
+        按适配器需要物化临时文件；插件自身不落盘，避免 data/temp 子目录被框架
+        清理后写入失败。
         """
         text = self._clean_voice_text(value)
         if not text:
@@ -89,16 +89,15 @@ class MiMoTTSPlugin(BasePlugin):
         try:
             logger.info(f"MiMo TTS: 开始合成，音色='{voice_desc[:50]}...'，文本长度={len(text)}")
             audio_bytes = await self._synthesize(voice_desc, text)
-
-            filename = f"mimo_tts_{int(time.time())}.wav"
-            file_path = os.path.join(self.temp_dir, filename)
-            with open(file_path, "wb") as f:
-                f.write(audio_bytes)
-
             logger.info(f"MiMo TTS: 合成完成，文件大小={len(audio_bytes)} bytes")
-            return [Record(record=file_path, name=filename)]
+            filename = f"mimo_tts_{int(time.time())}.wav"
+            return [Record(
+                record=base64.b64encode(audio_bytes).decode("ascii"),
+                mime="audio/wav",
+                name=filename,
+            )]
         except httpx.HTTPStatusError as e:
-            logger.error(f"MiMo TTS API 错误: {e.response.status_code} - {e.response.text}")
+            logger.error(f"MiMo TTS API 错误: {e.response.status_code} - {str(e.response.text)[:300]}")
         except Exception as e:
             logger.error(f"MiMo TTS 合成异常: {e}")
 
@@ -116,10 +115,10 @@ class MiMoTTSPlugin(BasePlugin):
         框架解析器只取标签的直接文本（child.text），标签内再嵌套子标签时
         内容会在解析阶段静默丢失（处理器收到空串，语音发不出去），
         所以必须在 llm_response 阶段先把 text_response 里的嵌套剥掉。
+
+        该兜底始终生效，不受 auto_format_fix 开关影响（该开关只控制发送前的拆分整理）。
         """
         if resp.tool_calls:
-            return
-        if not self.auto_format_fix:
             return
         text = resp.text_response or ""
         if "<mimo_tts" not in text:
@@ -201,7 +200,6 @@ class MiMoTTSPlugin(BasePlugin):
             return any(not isinstance(x, (At, Reply)) for x in elems)
 
         real_runs = [r for r in runs if not (len(r) == 1 and isinstance(r[0], Record)) and has_real_content(r)]
-        record_runs = [r for r in runs if len(r) == 1 and isinstance(r[0], Record)]
         stray = [e for r in runs
                  if not (len(r) == 1 and isinstance(r[0], Record)) and not has_real_content(r)
                  for e in r]
